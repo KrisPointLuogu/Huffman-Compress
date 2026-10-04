@@ -1,75 +1,146 @@
 # Huffman
 
-A tiny lossless compressor based on Huffman coding. It packs one or more
-files and directories into a single `.huf` archive and restores them later.
+一个用 C++ 实现的简易无损压缩工具。基于哈夫曼编码，把若干文件与目录打包成
+单个 `.huf` 归档，并能原样还原。
 
-## Build
+## 特性
 
-```
+- 无损压缩：往返解压后内容、权限位与修改时间保持一致
+- 支持多输入：一次可打包多个文件或目录，保留相对目录结构
+- 流式处理：文件内容按 64 KB 分块读写，内存占用不随文件增大
+- 单文件归档：整棵哈夫曼树只存一份，压缩率与实现都更简单
+- 极简依赖：只用 C++ 标准库容器与 POSIX 接口，文件 I/O 走 `FILE*`
+- 过程式风格：全部由函数组成，不使用类，宏仅用于常量
+
+## 构建
+
+```sh
 make
 ```
 
-This produces the `huffman` executable with `g++ -std=c++11 -O2`.
+等价于：
 
-## Usage
-
-```
-huffman c <out.huf> <input1> [input2 ...]
-huffman d <in.huf>  <outdir>
+```sh
+g++ -std=c++11 -O2 -Wall -Wextra -o huffman huffman.cpp
 ```
 
-Compress one or more files or directories:
+清理构建产物：
+
+```sh
+make clean
+```
+
+## 用法
 
 ```
+huffman c <out.huf> <input1> [input2 ...]   # 压缩
+huffman d <in.huf>  <outdir>                # 解压
+```
+
+压缩一个文件或目录：
+
+```sh
 huffman c backup.huf notes.txt photos
 ```
 
-Decompress into a directory:
+解压到指定目录：
 
-```
+```sh
 huffman d backup.huf restored
 ```
 
-Input paths are stored as given, relative to the current directory. Absolute
-paths, `..` components and duplicate archive paths are rejected. Empty
-directories are not stored.
+退出码：
 
-## Testing
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 成功 |
+| 1 | I/O 错误、格式损坏或存在风险校验失败 |
+| 2 | 命令行用法错误 |
+
+## 路径规则
+
+- 归档内的路径就是命令行给出的相对路径，开头的 `./` 与结尾的 `/` 会被去掉；
+- 目录会被递归处理，子路径原样保留，例如 `photos/a/b.jpg`；
+- 解压时在 `<outdir>` 下按归档路径逐级创建目录并还原文件；
+- 以下输入会被拒绝：
+
+  - 绝对路径（以 `/` 开头）
+  - 含 `..` 的路径
+  - 归档内重复的路径
+
+- 空目录不写入归档；符号链接与其他特殊文件会被跳过。
+
+## 归档格式
+
+所有整数均为固定宽度、小端序。
 
 ```
+magic        4 字节   "HUF1"
+version      1 字节
+file count   4 字节
+每个条目（共 file count 个）：
+  path len   2 字节
+  path       path len 字节
+  size       8 字节
+  mode       4 字节
+  mtime      8 字节
+tree len     8 字节
+tree         tree len 字节，先序位流
+data         压缩后的位流，末尾补 0 到整字节
+```
+
+### 编码原理
+
+1. **第一遍扫描**：按块读取所有输入，统计 256 个字节符号的出现频率，同时收集
+   各文件的路径、大小、权限与修改时间；
+2. **建树**：用优先队列（频率最小者优先）自底向上合并，构造哈夫曼树；
+3. **生成码表**：从树根出发，向左记 `0`、向右记 `1`，得到每个符号的变长前缀码；
+4. **第二遍扫描**：重新读取输入，逐字节查表并写入位流。
+
+树的序列化采用**先序**：
+
+- 内部结点：写 `1` 位，随后写完左右子树；
+- 叶子结点：写 `0` 位，随后写 1 字节原始符号。
+
+解压端按同样规则读回并重建整棵树。位流按**高位优先**（MSB first）读写；每个
+条目解码到其 `size` 个字节即停止，因此位流末尾的对齐填充位会被自然忽略。
+
+边界情况：
+
+- 若整个载荷为空（例如只打包了空文件），`tree len == 0`，不写树也不写数据；
+- 若只有一个不同符号，该符号被赋予 1 位编码 `0`，保证仍可解码。
+
+## 项目结构
+
+```
+huffman.cpp        全部实现：位 I/O、建树、归档读写、命令行
+Makefile           all / clean / test 目标
+test/roundtrip.sh  端到端往返测试脚本
+README.md
+```
+
+## 测试
+
+```sh
 make test
 ```
 
-`test/roundtrip.sh` builds a variety of inputs, compresses and decompresses
-them, then compares content, mode and mtime. It also checks the error paths.
+`test/roundtrip.sh` 会构造文本、纯二进制、全 0~255 字节、空文件、单符号文件、
+多层嵌套目录以及较大文件，压缩后再解压，并用 `diff` / `cmp` 比对内容，同时校验
+权限位与修改时间。脚本还会验证绝对路径、缺失输入、重复路径、错误魔数以及用法
+错误等分支是否正确失败。
 
-## Archive format
+## 限制
 
-All integers are little endian and fixed width.
+- 只处理普通文件；符号链接和特殊文件被跳过；
+- 输入必须是相对路径；
+- 归档头（文件清单）整体读入内存，文件内容则分块流式处理；
+- 不支持加密、增量更新或随机访问单个成员。
 
-```
-magic        4 bytes  "HUF1"
-version      1 byte
-file count   4 bytes
-entry * n:
-  path len   2 bytes
-  path       path len bytes
-  size       8 bytes
-  mode       4 bytes
-  mtime      8 bytes
-tree len     8 bytes
-tree         tree len bytes, preorder bitstream
-data         compressed bitstream, zero padded to a full byte
-```
+## 设计说明
 
-The tree is written in preorder: an internal node is a `1` bit followed by
-both children, a leaf is a `0` bit followed by the raw symbol byte. Codes are
-emitted most significant bit first. Decoding stops after each entry's stored
-size, so trailing padding bits are ignored.
-
-## Limitations
-
-- Works on regular files only; symlinks and special files are skipped.
-- Inputs must be relative paths.
-- The whole archive header is kept in memory, though file contents are
-  streamed in 64 KB chunks.
+- 全程过程式，无类、无继承、无模板元编程、无运算符重载、无异常；
+- 文件 I/O 使用 `FILE*`（`fopen` / `fread` / `fwrite` / `fclose`），不使用
+  `ifstream` / `ofstream`；
+- 整数按固定宽度和小端序写入，避免依赖宿主机字节序；
+- 写入失败时删除未完成的输出，避免留下损坏的归档。
