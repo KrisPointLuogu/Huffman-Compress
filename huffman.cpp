@@ -426,48 +426,29 @@ bool collect_input(const std::string &path, std::vector<Entry> &entries)
     return true;
 }
 
-bool count_file(const std::string &path, long long freq[256],
-                unsigned long long *total)
+void freq_sink(void *ctx, int symbol)
 {
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f)
-        return false;
-    unsigned char buf[IO_BUF_SIZE];
-    size_t n;
-    bool ok = true;
-    while ((n = fread(buf, 1, IO_BUF_SIZE, f)) > 0) {
-        for (size_t i = 0; i < n; ++i)
-            freq[buf[i]]++;
-        *total += n;
-    }
-    if (ferror(f))
-        ok = false;
-    fclose(f);
-    return ok;
+    long long *freq = (long long *)ctx;
+    freq[symbol]++;
 }
 
-bool encode_file(BitWriter *w, const std::string &path, const std::string codes[256])
+struct EncodeCtx {
+    BitWriter *w;
+    const std::string *codes;
+    bool ok;
+};
+
+void encode_sink(void *ctx, int symbol)
 {
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f)
-        return false;
-    unsigned char buf[IO_BUF_SIZE];
-    size_t n;
-    bool ok = true;
-    while (ok && (n = fread(buf, 1, IO_BUF_SIZE, f)) > 0) {
-        for (size_t i = 0; ok && i < n; ++i) {
-            const std::string &c = codes[buf[i]];
-            for (size_t k = 0; k < c.size(); ++k)
-                if (!bw_put_bit(w, c[k] == '1')) {
-                    ok = false;
-                    break;
-                }
+    EncodeCtx *e = (EncodeCtx *)ctx;
+    if (!e->ok)
+        return;
+    const std::string &c = e->codes[symbol];
+    for (size_t k = 0; k < c.size(); ++k)
+        if (!bw_put_bit(e->w, c[k] == '1')) {
+            e->ok = false;
+            return;
         }
-    }
-    if (ferror(f))
-        ok = false;
-    fclose(f);
-    return ok;
 }
 
 typedef void (*SymbolSink)(void *ctx, int symbol);
@@ -563,12 +544,21 @@ int pack(const char *out_path, int n_inputs, char **inputs)
         }
     }
 
+    for (size_t k = 0; k < entries.size(); ++k) {
+        unsigned long long runs = 0, bytes = 0;
+        if (!count_runs(entries[k].path, &runs, &bytes)) {
+            fprintf(stderr, "huffman: cannot read input: %s\n",
+                    entries[k].path.c_str());
+            return 1;
+        }
+        entries[k].flags = (2 * runs < bytes) ? 1u : 0u;
+    }
+
     long long freq[256];
     for (int i = 0; i < 256; ++i)
         freq[i] = 0;
-    unsigned long long total = 0;
     for (size_t k = 0; k < entries.size(); ++k)
-        if (!count_file(entries[k].path, freq, &total)) {
+        if (!walk_file(entries[k].path, entries[k].flags & 1, freq, freq_sink)) {
             fprintf(stderr, "huffman: cannot read input: %s\n",
                     entries[k].path.c_str());
             return 1;
@@ -614,8 +604,16 @@ int pack(const char *out_path, int n_inputs, char **inputs)
     }
     if (ok) {
         bw_init(&w, out);
-        for (size_t k = 0; ok && k < entries.size(); ++k)
-            ok = encode_file(&w, entries[k].path, codes);
+        EncodeCtx ec;
+        ec.w = &w;
+        ec.codes = codes;
+        ec.ok = true;
+        for (size_t k = 0; ok && k < entries.size(); ++k) {
+            if (!walk_file(entries[k].path, entries[k].flags & 1, &ec, encode_sink))
+                ok = false;
+            if (!ec.ok)
+                ok = false;
+        }
         ok = ok && bw_flush(&w);
     }
     if (fclose(out) != 0)
@@ -643,40 +641,71 @@ bool make_dirs(const std::string &path)
     return true;
 }
 
+int decode_symbol(BitReader *r, const Node *root)
+{
+    if (!root)
+        return -1;
+    if (!root->left && !root->right) {
+        if (br_get_bit(r) < 0)
+            return -1;
+        return root->symbol;
+    }
+    const Node *n = root;
+    while (n->left || n->right) {
+        int b = br_get_bit(r);
+        if (b < 0)
+            return -1;
+        n = b ? n->right : n->left;
+    }
+    return n->symbol;
+}
+
+bool push_byte(unsigned char *buf, size_t *used, unsigned char b, FILE *out)
+{
+    buf[(*used)++] = b;
+    if (*used == IO_BUF_SIZE) {
+        if (fwrite(buf, 1, *used, out) != *used)
+            return false;
+        *used = 0;
+    }
+    return true;
+}
+
 bool decode_stream(BitReader *r, const Node *root, unsigned long long size,
-                   FILE *out)
+                   bool use_rle, FILE *out)
 {
     if (!root)
         return size == 0;
     unsigned char buf[IO_BUF_SIZE];
     size_t used = 0;
-    bool leaf_root = !root->left && !root->right;
-    for (unsigned long long i = 0; i < size; ++i) {
-        int sym = 0;
-        if (leaf_root) {
-            if (br_get_bit(r) < 0)
-                return false;
-            sym = root->symbol;
-        } else {
-            const Node *n = root;
-            while (n->left || n->right) {
-                int b = br_get_bit(r);
-                if (b < 0)
-                    return false;
-                n = b ? n->right : n->left;
-            }
-            sym = n->symbol;
+    bool ok = true;
+    if (!use_rle) {
+        for (unsigned long long i = 0; ok && i < size; ++i) {
+            int sym = decode_symbol(r, root);
+            if (sym < 0)
+                ok = false;
+            else if (!push_byte(buf, &used, (unsigned char)sym, out))
+                ok = false;
         }
-        buf[used++] = (unsigned char)sym;
-        if (used == IO_BUF_SIZE) {
-            if (fwrite(buf, 1, used, out) != used)
-                return false;
-            used = 0;
+    } else {
+        unsigned long long produced = 0;
+        while (ok && produced < size) {
+            int sym = decode_symbol(r, root);
+            int cnt = (sym < 0) ? -1 : decode_symbol(r, root);
+            if (sym < 0 || cnt < 1 ||
+                produced + (unsigned long long)cnt > size) {
+                ok = false;
+                break;
+            }
+            for (int i = 0; i < cnt && ok; ++i)
+                if (!push_byte(buf, &used, (unsigned char)sym, out))
+                    ok = false;
+            produced += (unsigned long long)cnt;
         }
     }
-    if (used > 0 && fwrite(buf, 1, used, out) != used)
-        return false;
-    return true;
+    if (ok && used > 0 && fwrite(buf, 1, used, out) != used)
+        ok = false;
+    return ok;
 }
 
 int unpack(const char *in_path, const char *out_dir)
@@ -756,7 +785,8 @@ int unpack(const char *in_path, const char *out_dir)
             ok = false;
             break;
         }
-        ok = decode_stream(&r, root, entries[i].size, out);
+        ok = decode_stream(&r, root, entries[i].size,
+                           (entries[i].flags & 1) != 0, out);
         if (fclose(out) != 0)
             ok = false;
         if (!ok) {
