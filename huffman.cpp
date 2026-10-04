@@ -623,6 +623,17 @@ int pack(const char *out_path, int n_inputs, char **inputs)
         fprintf(stderr, "huffman: write error\n");
         return 1;
     }
+
+    unsigned long long original = 0;
+    for (size_t k = 0; k < entries.size(); ++k)
+        original += entries[k].size;
+    struct stat st;
+    unsigned long long compressed = 0;
+    if (stat(out_path, &st) == 0)
+        compressed = (unsigned long long)st.st_size;
+    double ratio = original ? (double)compressed / (double)original : 0.0;
+    fprintf(stderr, "huffman: %llu files, %llu bytes -> %llu bytes (ratio %.3f)\n",
+            (unsigned long long)entries.size(), original, compressed, ratio);
     return 0;
 }
 
