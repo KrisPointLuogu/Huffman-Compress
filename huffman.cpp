@@ -18,6 +18,7 @@ struct Entry {
     unsigned long long size;
     unsigned int mode;
     long long mtime;
+    unsigned int flags;
 };
 
 struct Node {
@@ -225,6 +226,7 @@ bool stat_entry(const std::string &path, Entry &e)
     e.size = (unsigned long long)st.st_size;
     e.mode = (unsigned int)st.st_mode;
     e.mtime = (long long)st.st_mtime;
+    e.flags = 0;
     return true;
 }
 
@@ -315,6 +317,8 @@ bool write_entry(FILE *f, const Entry &e)
         return false;
     if (!write_u64(f, (unsigned long long)e.mtime))
         return false;
+    if (!write_u8(f, e.flags & 0xff))
+        return false;
     return true;
 }
 
@@ -336,6 +340,10 @@ bool read_entry(FILE *f, Entry &e)
     if (!read_u64(f, &mtime))
         return false;
     e.mtime = (long long)mtime;
+    unsigned int flags = 0;
+    if (!read_u8(f, &flags))
+        return false;
+    e.flags = flags;
     return true;
 }
 
@@ -513,7 +521,7 @@ int pack(const char *out_path, int n_inputs, char **inputs)
 
     bool ok = true;
     ok = ok && fwrite("HUF1", 1, 4, out) == 4;
-    ok = ok && write_u8(out, 1);
+    ok = ok && write_u8(out, 2);
     ok = ok && write_u32(out, (unsigned long long)entries.size());
     for (size_t k = 0; ok && k < entries.size(); ++k)
         ok = write_entry(out, entries[k]);
@@ -616,9 +624,19 @@ int unpack(const char *in_path, const char *out_dir)
     unsigned long long count = 0;
     bool ok = true;
     ok = ok && fread(magic, 1, 4, in) == 4 && memcmp(magic, "HUF1", 4) == 0;
-    ok = ok && read_u8(in, &version) && version == 1;
-    ok = ok && read_u32(in, &count);
+    ok = ok && read_u8(in, &version);
     if (!ok) {
+        fclose(in);
+        fprintf(stderr, "huffman: bad archive header: %s\n", in_path);
+        return 1;
+    }
+    if (version != 2) {
+        fclose(in);
+        fprintf(stderr, "huffman: unsupported version %u: %s\n", version,
+                in_path);
+        return 1;
+    }
+    if (!read_u32(in, &count)) {
         fclose(in);
         fprintf(stderr, "huffman: bad archive header: %s\n", in_path);
         return 1;
