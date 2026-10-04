@@ -1,12 +1,15 @@
 #include <cstdio>
 #include <cstddef>
+#include <cstring>
+#include <cerrno>
+#include <ctime>
 #include <vector>
 #include <queue>
 #include <string>
 #include <set>
-#include <cstring>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <utime.h>
 
 const size_t IO_BUF_SIZE = 65536;
 
@@ -546,6 +549,146 @@ int pack(const char *out_path, int n_inputs, char **inputs)
         fprintf(stderr, "huffman: write error\n");
         return 1;
     }
+    return 0;
+}
+
+bool make_dirs(const std::string &path)
+{
+    size_t pos = 0;
+    while (true) {
+        size_t slash = path.find('/', pos);
+        if (slash == std::string::npos)
+            break;
+        std::string dir = path.substr(0, slash);
+        if (!dir.empty() && mkdir(dir.c_str(), 0777) != 0 && errno != EEXIST)
+            return false;
+        pos = slash + 1;
+    }
+    return true;
+}
+
+bool decode_stream(BitReader *r, const Node *root, unsigned long long size,
+                   FILE *out)
+{
+    if (!root)
+        return size == 0;
+    unsigned char buf[IO_BUF_SIZE];
+    size_t used = 0;
+    bool leaf_root = !root->left && !root->right;
+    for (unsigned long long i = 0; i < size; ++i) {
+        int sym = 0;
+        if (leaf_root) {
+            if (br_get_bit(r) < 0)
+                return false;
+            sym = root->symbol;
+        } else {
+            const Node *n = root;
+            while (n->left || n->right) {
+                int b = br_get_bit(r);
+                if (b < 0)
+                    return false;
+                n = b ? n->right : n->left;
+            }
+            sym = n->symbol;
+        }
+        buf[used++] = (unsigned char)sym;
+        if (used == IO_BUF_SIZE) {
+            if (fwrite(buf, 1, used, out) != used)
+                return false;
+            used = 0;
+        }
+    }
+    if (used > 0 && fwrite(buf, 1, used, out) != used)
+        return false;
+    return true;
+}
+
+int unpack(const char *in_path, const char *out_dir)
+{
+    FILE *in = fopen(in_path, "rb");
+    if (!in) {
+        fprintf(stderr, "huffman: cannot open input: %s\n", in_path);
+        return 1;
+    }
+
+    char magic[4];
+    unsigned int version = 0;
+    unsigned long long count = 0;
+    bool ok = true;
+    ok = ok && fread(magic, 1, 4, in) == 4 && memcmp(magic, "HUF1", 4) == 0;
+    ok = ok && read_u8(in, &version) && version == 1;
+    ok = ok && read_u32(in, &count);
+    if (!ok) {
+        fclose(in);
+        fprintf(stderr, "huffman: bad archive header: %s\n", in_path);
+        return 1;
+    }
+
+    std::vector<Entry> entries(count);
+    for (unsigned long long i = 0; ok && i < count; ++i)
+        ok = read_entry(in, entries[i]);
+    for (unsigned long long i = 0; ok && i < count; ++i)
+        if (!path_is_safe(entries[i].path)) {
+            fprintf(stderr, "huffman: unsafe archive path: %s\n",
+                    entries[i].path.c_str());
+            ok = false;
+        }
+    unsigned long long tree_len = 0;
+    ok = ok && read_u64(in, &tree_len);
+    if (!ok) {
+        fclose(in);
+        fprintf(stderr, "huffman: truncated archive: %s\n", in_path);
+        return 1;
+    }
+
+    std::vector<Node> pool;
+    pool.reserve(512);
+    Node *root = 0;
+    BitReader r;
+    br_init(&r, in);
+    if (tree_len > 0) {
+        root = read_tree(&r, pool);
+        if (!root) {
+            fclose(in);
+            fprintf(stderr, "huffman: corrupt tree: %s\n", in_path);
+            return 1;
+        }
+        br_align(&r);
+    }
+
+    for (unsigned long long i = 0; ok && i < count; ++i) {
+        std::string full = std::string(out_dir) + "/" + entries[i].path;
+        if (!make_dirs(full)) {
+            fprintf(stderr, "huffman: cannot create directory for: %s\n",
+                    full.c_str());
+            ok = false;
+            break;
+        }
+        FILE *out = fopen(full.c_str(), "wb");
+        if (!out) {
+            fprintf(stderr, "huffman: cannot create file: %s\n", full.c_str());
+            ok = false;
+            break;
+        }
+        ok = decode_stream(&r, root, entries[i].size, out);
+        if (fclose(out) != 0)
+            ok = false;
+        if (!ok) {
+            fprintf(stderr, "huffman: corrupt data at: %s\n",
+                    entries[i].path.c_str());
+            break;
+        }
+        chmod(full.c_str(), entries[i].mode & 07777);
+        struct utimbuf ut;
+        ut.actime = (time_t)entries[i].mtime;
+        ut.modtime = (time_t)entries[i].mtime;
+        utime(full.c_str(), &ut);
+    }
+
+    if (fclose(in) != 0)
+        ok = false;
+    if (!ok)
+        return 1;
     return 0;
 }
 
