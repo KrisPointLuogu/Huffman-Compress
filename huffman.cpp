@@ -705,6 +705,21 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         return 2;
     }
-    fprintf(stderr, "huffman: not implemented yet\n");
-    return 1;
+    std::string cmd = argv[1];
+    if (cmd == "c") {
+        if (argc < 4) {
+            print_usage(argv[0]);
+            return 2;
+        }
+        return pack(argv[2], argc - 3, argv + 3);
+    }
+    if (cmd == "d") {
+        if (argc != 4) {
+            print_usage(argv[0]);
+            return 2;
+        }
+        return unpack(argv[2], argv[3]);
+    }
+    print_usage(argv[0]);
+    return 2;
 }
