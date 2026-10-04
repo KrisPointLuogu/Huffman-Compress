@@ -1,7 +1,69 @@
 #include <cstdio>
 #include <cstddef>
+#include <vector>
+#include <queue>
+#include <string>
 
 const size_t IO_BUF_SIZE = 65536;
+
+struct Node {
+    long long freq;
+    int symbol;
+    Node *left;
+    Node *right;
+};
+
+bool node_cmp(const Node *a, const Node *b)
+{
+    if (a->freq != b->freq)
+        return a->freq > b->freq;
+    return a->symbol > b->symbol;
+}
+
+Node *new_node(std::vector<Node> &pool, long long freq, int symbol,
+               Node *left, Node *right)
+{
+    Node n;
+    n.freq = freq;
+    n.symbol = symbol;
+    n.left = left;
+    n.right = right;
+    pool.push_back(n);
+    return &pool.back();
+}
+
+Node *build_tree(const long long freq[256], std::vector<Node> &pool)
+{
+    std::priority_queue<Node *, std::vector<Node *>,
+                        bool (*)(const Node *, const Node *)> pq(node_cmp);
+    for (int i = 0; i < 256; ++i)
+        if (freq[i] > 0)
+            pq.push(new_node(pool, freq[i], i, 0, 0));
+
+    if (pq.empty())
+        return 0;
+
+    while (pq.size() > 1) {
+        Node *a = pq.top();
+        pq.pop();
+        Node *b = pq.top();
+        pq.pop();
+        pq.push(new_node(pool, a->freq + b->freq, -1, a, b));
+    }
+    return pq.top();
+}
+
+void gen_codes(const Node *n, const std::string &prefix, std::string codes[256])
+{
+    if (!n)
+        return;
+    if (!n->left && !n->right) {
+        codes[n->symbol] = prefix.empty() ? std::string("0") : prefix;
+        return;
+    }
+    gen_codes(n->left, prefix + "0", codes);
+    gen_codes(n->right, prefix + "1", codes);
+}
 
 struct BitWriter {
     FILE *out;
