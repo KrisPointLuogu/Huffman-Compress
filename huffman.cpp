@@ -176,6 +176,52 @@ void br_align(BitReader *r)
     r->left = 0;
 }
 
+void write_tree(BitWriter *w, const Node *n)
+{
+    if (!n)
+        return;
+    if (!n->left && !n->right) {
+        bw_put_bit(w, 0);
+        bw_put_byte(w, (unsigned char)n->symbol);
+        return;
+    }
+    bw_put_bit(w, 1);
+    write_tree(w, n->left);
+    write_tree(w, n->right);
+}
+
+int br_get_byte(BitReader *r)
+{
+    int v = 0;
+    for (int i = 0; i < 8; ++i) {
+        int b = br_get_bit(r);
+        if (b < 0)
+            return -1;
+        v = (v << 1) | b;
+    }
+    return v;
+}
+
+Node *read_tree(BitReader *r, std::vector<Node> &pool)
+{
+    int bit = br_get_bit(r);
+    if (bit < 0)
+        return 0;
+    if (bit == 0) {
+        int sym = br_get_byte(r);
+        if (sym < 0)
+            return 0;
+        return new_node(pool, 0, sym, 0, 0);
+    }
+    Node *left = read_tree(r, pool);
+    if (!left)
+        return 0;
+    Node *right = read_tree(r, pool);
+    if (!right)
+        return 0;
+    return new_node(pool, 0, -1, left, right);
+}
+
 static void print_usage(const char *prog)
 {
     fprintf(stderr, "usage:\n");
