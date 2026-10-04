@@ -3,7 +3,10 @@
 #include <vector>
 #include <queue>
 #include <string>
+#include <set>
+#include <cstring>
 #include <sys/stat.h>
+#include <dirent.h>
 
 const size_t IO_BUF_SIZE = 65536;
 
@@ -222,6 +225,12 @@ bool stat_entry(const std::string &path, Entry &e)
     return true;
 }
 
+bool write_u8(FILE *f, unsigned int v)
+{
+    unsigned char b = (unsigned char)(v & 0xff);
+    return fwrite(&b, 1, 1, f) == 1;
+}
+
 bool write_u16(FILE *f, unsigned int v)
 {
     unsigned char b[2];
@@ -244,6 +253,15 @@ bool write_u64(FILE *f, unsigned long long v)
     for (int i = 0; i < 8; ++i)
         b[i] = (unsigned char)((v >> (8 * i)) & 0xff);
     return fwrite(b, 1, 8, f) == 8;
+}
+
+bool read_u8(FILE *f, unsigned int *v)
+{
+    unsigned char b;
+    if (fread(&b, 1, 1, f) != 1)
+        return false;
+    *v = b;
+    return true;
 }
 
 bool read_u16(FILE *f, unsigned int *v)
@@ -362,6 +380,173 @@ Node *read_tree(BitReader *r, std::vector<Node> &pool)
     if (!right)
         return 0;
     return new_node(pool, 0, -1, left, right);
+}
+
+bool collect_input(const std::string &path, std::vector<Entry> &entries)
+{
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0)
+        return false;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path.c_str());
+        if (!d)
+            return false;
+        struct dirent *de;
+        bool ok = true;
+        while ((de = readdir(d)) != 0) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+            std::string child = path + "/" + de->d_name;
+            if (!collect_input(child, entries)) {
+                ok = false;
+                break;
+            }
+        }
+        closedir(d);
+        return ok;
+    }
+    if (S_ISREG(st.st_mode)) {
+        Entry e;
+        if (!stat_entry(path, e))
+            return false;
+        entries.push_back(e);
+        return true;
+    }
+    return true;
+}
+
+bool count_file(const std::string &path, long long freq[256],
+                unsigned long long *total)
+{
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    unsigned char buf[IO_BUF_SIZE];
+    size_t n;
+    bool ok = true;
+    while ((n = fread(buf, 1, IO_BUF_SIZE, f)) > 0) {
+        for (size_t i = 0; i < n; ++i)
+            freq[buf[i]]++;
+        *total += n;
+    }
+    if (ferror(f))
+        ok = false;
+    fclose(f);
+    return ok;
+}
+
+bool encode_file(BitWriter *w, const std::string &path, const std::string codes[256])
+{
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    unsigned char buf[IO_BUF_SIZE];
+    size_t n;
+    bool ok = true;
+    while (ok && (n = fread(buf, 1, IO_BUF_SIZE, f)) > 0) {
+        for (size_t i = 0; ok && i < n; ++i) {
+            const std::string &c = codes[buf[i]];
+            for (size_t k = 0; k < c.size(); ++k)
+                if (!bw_put_bit(w, c[k] == '1')) {
+                    ok = false;
+                    break;
+                }
+        }
+    }
+    if (ferror(f))
+        ok = false;
+    fclose(f);
+    return ok;
+}
+
+int pack(const char *out_path, int n_inputs, char **inputs)
+{
+    std::vector<Entry> entries;
+    std::set<std::string> seen;
+    for (int i = 0; i < n_inputs; ++i) {
+        std::string p = normalize_path(inputs[i]);
+        if (!path_is_safe(p)) {
+            fprintf(stderr, "huffman: unsafe input path: %s\n", inputs[i]);
+            return 1;
+        }
+        std::vector<Entry> local;
+        if (!collect_input(p, local)) {
+            fprintf(stderr, "huffman: cannot read input: %s\n", inputs[i]);
+            return 1;
+        }
+        for (size_t k = 0; k < local.size(); ++k) {
+            if (!seen.insert(local[k].path).second) {
+                fprintf(stderr, "huffman: duplicate archive path: %s\n",
+                        local[k].path.c_str());
+                return 1;
+            }
+            entries.push_back(local[k]);
+        }
+    }
+
+    long long freq[256];
+    for (int i = 0; i < 256; ++i)
+        freq[i] = 0;
+    unsigned long long total = 0;
+    for (size_t k = 0; k < entries.size(); ++k)
+        if (!count_file(entries[k].path, freq, &total)) {
+            fprintf(stderr, "huffman: cannot read input: %s\n",
+                    entries[k].path.c_str());
+            return 1;
+        }
+
+    std::vector<Node> pool;
+    pool.reserve(512);
+    Node *root = build_tree(freq, pool);
+    std::string codes[256];
+    if (root)
+        gen_codes(root, "", codes);
+
+    FILE *out = fopen(out_path, "wb");
+    if (!out) {
+        fprintf(stderr, "huffman: cannot open output: %s\n", out_path);
+        return 1;
+    }
+
+    bool ok = true;
+    ok = ok && fwrite("HUF1", 1, 4, out) == 4;
+    ok = ok && write_u8(out, 1);
+    ok = ok && write_u32(out, (unsigned long long)entries.size());
+    for (size_t k = 0; ok && k < entries.size(); ++k)
+        ok = write_entry(out, entries[k]);
+
+    long tree_len_pos = 0, tree_start = 0, tree_end = 0;
+    BitWriter w;
+    if (ok) {
+        tree_len_pos = ftell(out);
+        ok = write_u64(out, 0);
+        tree_start = ftell(out);
+        bw_init(&w, out);
+        if (root)
+            write_tree(&w, root);
+        ok = ok && bw_flush(&w);
+        tree_end = ftell(out);
+    }
+    if (ok) {
+        long tree_len = tree_end - tree_start;
+        fseek(out, tree_len_pos, SEEK_SET);
+        ok = write_u64(out, (unsigned long long)tree_len);
+        fseek(out, tree_end, SEEK_SET);
+    }
+    if (ok) {
+        bw_init(&w, out);
+        for (size_t k = 0; ok && k < entries.size(); ++k)
+            ok = encode_file(&w, entries[k].path, codes);
+        ok = ok && bw_flush(&w);
+    }
+    if (fclose(out) != 0)
+        ok = false;
+    if (!ok) {
+        remove(out_path);
+        fprintf(stderr, "huffman: write error\n");
+        return 1;
+    }
+    return 0;
 }
 
 static void print_usage(const char *prog)
