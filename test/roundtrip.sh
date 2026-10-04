@@ -29,10 +29,12 @@ while [ "$i" -lt 256 ]; do
     printf "\\$(printf '%03o' "$i")"
     i=$((i + 1))
 done > src/all.bin
+dd if=/dev/zero bs=1000 count=1 2>/dev/null > src/run.bin
+printf 'abcabcabc' >> src/run.bin
 printf 'extra top level\n' > extra.txt
 chmod 640 src/a.txt
 
-"$BIN" c archive.huf src extra.txt || fail "compress"
+"$BIN" c archive.huf src extra.txt 2>/dev/null || fail "compress"
 mkdir out
 "$BIN" d archive.huf out || fail "decompress"
 diff -r src out/src || fail "directory content"
@@ -41,7 +43,19 @@ cmp extra.txt out/extra.txt || fail "extra.txt content"
 [ "$(stat -c %Y src/a.txt)" = "$(stat -c %Y out/src/a.txt)" ] || fail "mtime restore"
 ok "round trip of text, binary, empty, single symbol and nested files"
 
-"$BIN" c only_empty.huf src/empty.bin || fail "compress empty only"
+"$BIN" c run.huf src/run.bin 2>/dev/null || fail "compress run heavy"
+run_raw=$(stat -c %s src/run.bin)
+run_arc=$(stat -c %s run.huf)
+[ "$run_arc" -lt "$run_raw" ] || fail "run heavy file not shrunk"
+ok "run length front end shrinks a run heavy file"
+
+"$BIN" c rnd.huf src/sub/big.bin 2>/dev/null || fail "compress run free"
+rnd_raw=$(stat -c %s src/sub/big.bin)
+rnd_arc=$(stat -c %s rnd.huf)
+[ "$rnd_arc" -lt $((rnd_raw + rnd_raw / 20 + 4096)) ] || fail "run free file expanded too much"
+ok "run front end does not inflate run free data"
+
+"$BIN" c only_empty.huf src/empty.bin 2>/dev/null || fail "compress empty only"
 mkdir out_empty
 "$BIN" d only_empty.huf out_empty || fail "decompress empty only"
 [ -f out_empty/src/empty.bin ] || fail "empty file missing"
