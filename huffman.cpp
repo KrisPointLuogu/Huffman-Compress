@@ -470,6 +470,74 @@ bool encode_file(BitWriter *w, const std::string &path, const std::string codes[
     return ok;
 }
 
+typedef void (*SymbolSink)(void *ctx, int symbol);
+
+bool count_runs(const std::string &path, unsigned long long *runs,
+                unsigned long long *bytes)
+{
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    unsigned char buf[IO_BUF_SIZE];
+    size_t n;
+    int cur = -1;
+    unsigned long long total = 0, rc = 0;
+    bool ok = true;
+    while ((n = fread(buf, 1, IO_BUF_SIZE, f)) > 0) {
+        for (size_t i = 0; i < n; ++i) {
+            total++;
+            if ((int)buf[i] != cur) {
+                cur = buf[i];
+                rc++;
+            }
+        }
+    }
+    if (ferror(f))
+        ok = false;
+    fclose(f);
+    *runs = rc;
+    *bytes = total;
+    return ok;
+}
+
+bool walk_file(const std::string &path, bool use_rle, void *ctx, SymbolSink sink)
+{
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    unsigned char buf[IO_BUF_SIZE];
+    size_t n;
+    int cur = -1;
+    unsigned long long count = 0;
+    bool ok = true;
+    while ((n = fread(buf, 1, IO_BUF_SIZE, f)) > 0) {
+        for (size_t i = 0; i < n; ++i) {
+            int b = buf[i];
+            if (!use_rle) {
+                sink(ctx, b);
+            } else if (count == 0) {
+                cur = b;
+                count = 1;
+            } else if (b == cur && count < 255) {
+                count++;
+            } else {
+                sink(ctx, cur);
+                sink(ctx, (int)count);
+                cur = b;
+                count = 1;
+            }
+        }
+    }
+    if (use_rle && count > 0) {
+        sink(ctx, cur);
+        sink(ctx, (int)count);
+    }
+    if (ferror(f))
+        ok = false;
+    fclose(f);
+    return ok;
+}
+
 int pack(const char *out_path, int n_inputs, char **inputs)
 {
     std::vector<Entry> entries;
