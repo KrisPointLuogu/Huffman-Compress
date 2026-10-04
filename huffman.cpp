@@ -3,8 +3,16 @@
 #include <vector>
 #include <queue>
 #include <string>
+#include <sys/stat.h>
 
 const size_t IO_BUF_SIZE = 65536;
+
+struct Entry {
+    std::string path;
+    unsigned long long size;
+    unsigned int mode;
+    long long mtime;
+};
 
 struct Node {
     long long freq;
@@ -174,6 +182,140 @@ int br_get_bit(BitReader *r)
 void br_align(BitReader *r)
 {
     r->left = 0;
+}
+
+std::string normalize_path(const std::string &in)
+{
+    std::string p = in;
+    while (p.size() >= 2 && p[0] == '.' && p[1] == '/')
+        p.erase(0, 2);
+    while (!p.empty() && p[p.size() - 1] == '/')
+        p.erase(p.size() - 1);
+    return p;
+}
+
+bool path_is_safe(const std::string &p)
+{
+    if (p.empty() || p[0] == '/')
+        return false;
+    size_t i = 0;
+    while (i < p.size()) {
+        size_t j = p.find('/', i);
+        if (j == std::string::npos)
+            j = p.size();
+        if (p.compare(i, j - i, "..") == 0)
+            return false;
+        i = j + 1;
+    }
+    return true;
+}
+
+bool stat_entry(const std::string &path, Entry &e)
+{
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0)
+        return false;
+    e.path = normalize_path(path);
+    e.size = (unsigned long long)st.st_size;
+    e.mode = (unsigned int)st.st_mode;
+    e.mtime = (long long)st.st_mtime;
+    return true;
+}
+
+bool write_u16(FILE *f, unsigned int v)
+{
+    unsigned char b[2];
+    b[0] = (unsigned char)(v & 0xff);
+    b[1] = (unsigned char)((v >> 8) & 0xff);
+    return fwrite(b, 1, 2, f) == 2;
+}
+
+bool write_u32(FILE *f, unsigned long long v)
+{
+    unsigned char b[4];
+    for (int i = 0; i < 4; ++i)
+        b[i] = (unsigned char)((v >> (8 * i)) & 0xff);
+    return fwrite(b, 1, 4, f) == 4;
+}
+
+bool write_u64(FILE *f, unsigned long long v)
+{
+    unsigned char b[8];
+    for (int i = 0; i < 8; ++i)
+        b[i] = (unsigned char)((v >> (8 * i)) & 0xff);
+    return fwrite(b, 1, 8, f) == 8;
+}
+
+bool read_u16(FILE *f, unsigned int *v)
+{
+    unsigned char b[2];
+    if (fread(b, 1, 2, f) != 2)
+        return false;
+    *v = (unsigned int)b[0] | ((unsigned int)b[1] << 8);
+    return true;
+}
+
+bool read_u32(FILE *f, unsigned long long *v)
+{
+    unsigned char b[4];
+    if (fread(b, 1, 4, f) != 4)
+        return false;
+    unsigned long long r = 0;
+    for (int i = 0; i < 4; ++i)
+        r |= (unsigned long long)b[i] << (8 * i);
+    *v = r;
+    return true;
+}
+
+bool read_u64(FILE *f, unsigned long long *v)
+{
+    unsigned char b[8];
+    if (fread(b, 1, 8, f) != 8)
+        return false;
+    unsigned long long r = 0;
+    for (int i = 0; i < 8; ++i)
+        r |= (unsigned long long)b[i] << (8 * i);
+    *v = r;
+    return true;
+}
+
+bool write_entry(FILE *f, const Entry &e)
+{
+    if (e.path.size() > 65535)
+        return false;
+    if (!write_u16(f, (unsigned int)e.path.size()))
+        return false;
+    if (e.path.size() > 0 &&
+        fwrite(e.path.data(), 1, e.path.size(), f) != e.path.size())
+        return false;
+    if (!write_u64(f, e.size))
+        return false;
+    if (!write_u32(f, e.mode))
+        return false;
+    if (!write_u64(f, (unsigned long long)e.mtime))
+        return false;
+    return true;
+}
+
+bool read_entry(FILE *f, Entry &e)
+{
+    unsigned int plen = 0;
+    if (!read_u16(f, &plen))
+        return false;
+    e.path.assign(plen, '\0');
+    if (plen > 0 && fread(&e.path[0], 1, plen, f) != plen)
+        return false;
+    if (!read_u64(f, &e.size))
+        return false;
+    unsigned long long mode = 0;
+    if (!read_u32(f, &mode))
+        return false;
+    e.mode = (unsigned int)mode;
+    unsigned long long mtime = 0;
+    if (!read_u64(f, &mtime))
+        return false;
+    e.mtime = (long long)mtime;
+    return true;
 }
 
 void write_tree(BitWriter *w, const Node *n)
